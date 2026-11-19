@@ -1,0 +1,57 @@
+# Module 1 demo: log in to AWS from GitHub Actions without any stored AWS keys.
+# Run it from the Actions tab (workflow_dispatch). Needs two repo variables:
+#   AWS_ROLE_ARN  - output "role_arn" from 01-github-oidc/terraform
+#   AWS_REGION    - e.g. us-east-1
+name: oidc-demo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # allows the job to request a GitHub OIDC token
+  contents: read
+
+jobs:
+  aws-login:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show the token's claims (what AWS will check)
+        run: |
+          TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          # A JWT is header.payload.signature; print selected payload claims (never the token itself).
+          python3 - "$TOKEN" <<'PY'
+          import sys, json, base64
+          payload = sys.argv[1].split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          print(json.dumps({k: claims[k] for k in ("iss", "aud", "sub", "repository", "ref", "exp")}, indent=2))
+          PY
+
+      - name: Exchange the GitHub token for temporary AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-${{ github.run_id }}
+
+      - name: Who am I in AWS?
+        run: aws sts get-caller-identity
+
+      - name: Allowed - list the lab VPC
+        run: |
+          aws ec2 describe-vpcs --filters Name=tag:Project,Values=cloud-platform-lab \
+            --query 'Vpcs[].{VpcId:VpcId,Cidr:CidrBlock}' --output table
+
+      - name: Not allowed - list all S3 buckets (should be AccessDenied)
+        run: |
+          if aws s3 ls 2>err.txt; then
+            echo "Unexpected: the role can list all buckets"; exit 1
+          else
+            echo "Denied as expected:"; cat err.txt
+          fi
+
+      - name: Credentials are temporary
+        run: |
+          echo "AWS_SESSION_TOKEN is set: $([ -n "$AWS_SESSION_TOKEN" ] && echo yes || echo no)"
+          echo "Access key prefix: ${AWS_ACCESS_KEY_ID:0:4}  (ASIA = temporary STS credentials, AKIA = long-lived user key)"
